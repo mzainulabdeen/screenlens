@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<title>ScreenLens</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff;
+    font-family: system-ui, -apple-system, Roboto, sans-serif; overflow: hidden; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #panel { position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+    background: rgba(0,0,0,.78); backdrop-filter: blur(6px); }
+  #status { font-size: 12px; color: #aaa; min-height: 16px; }
+  #result { margin-top: 6px; font-size: 16px; line-height: 1.4; max-height: 38vh;
+    overflow-y: auto; white-space: pre-wrap; }
+  #result:empty { display: none; }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  button { flex: 1; padding: 13px 0; border: 0; border-radius: 10px; font-size: 15px;
+    font-weight: 600; background: #2a2a2a; color: #fff; }
+  #describe { flex: 2; background: #1a73e8; }
+  #auto.on { background: #188038; }
+  button:disabled { opacity: .5; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none;
+    transition: opacity .25s; }
+  #settings { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none;
+    align-items: center; justify-content: center; padding: 20px; z-index: 10; }
+  #settings.open { display: flex; }
+  .card { background: #1e1e1e; border-radius: 14px; padding: 18px; width: 100%; max-width: 420px; }
+  .card h2 { margin: 0 0 12px; font-size: 18px; }
+  .card label { display: block; font-size: 13px; color: #bbb; margin: 10px 0 4px; }
+  .card input[type=text], .card input[type=password] { width: 100%; padding: 11px;
+    border-radius: 8px; border: 1px solid #444; background: #111; color: #fff; font-size: 15px; }
+  .card .chk { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: #ddd; }
+  .card a { color: #8ab4f8; }
+</style>
+</head>
+<body>
+<video id="video" autoplay playsinline muted></video>
+<div id="flash"></div>
+
+<div id="panel">
+  <div id="status">Starting camera…</div>
+  <div id="result"></div>
+  <div class="row">
+    <button id="describe">Describe</button>
+    <button id="auto">Auto: OFF</button>
+    <button id="gear" aria-label="Settings">⚙</button>
+  </div>
+</div>
+
+<div id="settings">
+  <div class="card">
+    <h2>Settings</h2>
+    <label for="key">Gemini API key — free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a></label>
+    <input id="key" type="password" autocomplete="off" placeholder="AIza…">
+    <label for="model">Model</label>
+    <input id="model" type="text" placeholder="gemini-flash-latest">
+    <div class="chk"><input id="search" type="checkbox" checked><label for="search" style="margin:0;color:#ddd">Use Google Search grounding</label></div>
+    <div class="row">
+      <button id="cancel">Cancel</button>
+      <button id="save" style="background:#1a73e8">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const DEFAULT_MODEL = 'gemini-flash-latest';
+const AUTO_MS = 3000;
+const PROMPT =
+  'This is a phone-camera photo of a screen (monitor, laptop, TV or phone). ' +
+  'Ignore glare, moiré and the bezel. In 2-4 short sentences, say what is shown and explain it. ' +
+  'If it is an error or code, explain the cause and the fix. If it is a product, place or object, ' +
+  'identify it. Plain text, no markdown.';
+
+const $ = id => document.getElementById(id);
+const video = $('video'), statusEl = $('status'), resultEl = $('result');
+let busy = false, autoTimer = null, lastHash = null;
+
+const store = {
+  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} }
+};
+const cfg = () => ({
+  key: store.get('sl_key', '').trim(),
+  model: store.get('sl_model', DEFAULT_MODEL).trim() || DEFAULT_MODEL,
+  search: store.get('sl_search', '1') === '1'
+});
+
+// ---------- camera ----------
+async function startCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    statusEl.textContent = 'Camera not available. Open this page over HTTPS in Chrome.';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+    statusEl.textContent = 'Point at a screen and tap Describe (or tap the picture)';
+  } catch (e) {
+    statusEl.textContent = 'Camera error: ' + e.message;
+  }
+}
+
+function grabFrame(maxSide = 1024) {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return null;
+  const s = Math.min(1, maxSide / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * s); c.height = Math.round(h * s);
+  c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+  return c;
+}
+
+// 64-bit average hash (as two 32-bit halves) to skip unchanged frames in Auto mode
+function aHash(canvas) {
+  const c = document.createElement('canvas'); c.width = 8; c.height = 8;
+  const ctx = c.getContext('2d'); ctx.drawImage(canvas, 0, 0, 8, 8);
+  const d = ctx.getImageData(0, 0, 8, 8).data, g = [];
+  for (let i = 0; i < 64; i++) g.push(d[i*4]*.299 + d[i*4+1]*.587 + d[i*4+2]*.114);
+  const avg = g.reduce((a, b) => a + b) / 64;
+  return g.map(v => v > avg ? 1 : 0);
+}
+const hamming = (a, b) => a.reduce((n, v, i) => n + (v !== b[i]), 0);
+
+// ---------- Gemini ----------
+async function describe(auto) {
+  if (busy) return;
+  const { key, model, search } = cfg();
+  if (!key) { openSettings(); return; }
+  const frame = grabFrame();
+  if (!frame) return;
+
+  const h = aHash(frame);
+  if (auto && lastHash && hamming(h, lastHash) <= 6) return;  // scene unchanged
+  lastHash = h;
+
+  busy = true;
+  $('describe').disabled = true;
+  if (!auto) { $('flash').style.opacity = .5; setTimeout(() => $('flash').style.opacity = 0, 120); }
+  statusEl.textContent = `Thinking… (${model}${search ? ' + Google Search' : ''})`;
+  resultEl.textContent = '';
+  const t0 = performance.now();
+
+  const b64 = frame.toDataURL('image/jpeg', 0.8).split(',')[1];
+  const body = {
+    contents: [{ role: 'user', parts: [
+      { inline_data: { mime_type: 'image/jpeg', data: b64 } },
+      { text: PROMPT }
+    ]}]
+  };
+  if (search) body.tools = [{ google_search: {} }];
+
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify(body) });
+
+    if (!res.ok) {
+      const t = await res.text();
+      let msg = t; try { msg = JSON.parse(t).error.message; } catch {}
+      throw new Error(`HTTP ${res.status}: ${msg}`);
+    }
+
+    const sources = new Set();
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
+        const cand = j.candidates?.[0];
+        for (const p of cand?.content?.parts ?? []) {
+          if (p.text && !p.thought) resultEl.textContent += p.text;
+        }
+        for (const ch of cand?.groundingMetadata?.groundingChunks ?? []) {
+          if (ch.web?.title) sources.add(ch.web.title);
+        }
+        resultEl.scrollTop = resultEl.scrollHeight;
+      }
+    }
+    if (sources.size) resultEl.textContent += '\n\nSources: ' + [...sources].slice(0, 3).join(' · ');
+    statusEl.textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(1)}s — tap to describe again`;
+  } catch (e) {
+    statusEl.textContent = 'Error';
+    resultEl.textContent = e.message;
+  } finally {
+    busy = false;
+    $('describe').disabled = false;
+  }
+}
+
+// ---------- UI ----------
+function toggleAuto() {
+  if (autoTimer) {
+    clearInterval(autoTimer); autoTimer = null;
+  } else {
+    lastHash = null; describe(true);
+    autoTimer = setInterval(() => describe(true), AUTO_MS);
+  }
+  $('auto').textContent = autoTimer ? 'Auto: ON' : 'Auto: OFF';
+  $('auto').classList.toggle('on', !!autoTimer);
+}
+
+function openSettings() {
+  const c = cfg();
+  $('key').value = c.key; $('model').value = c.model; $('search').checked = c.search;
+  $('settings').classList.add('open');
+}
+function closeSettings() { $('settings').classList.remove('open'); }
+
+$('describe').onclick = () => describe(false);
+video.onclick = () => describe(false);
+$('auto').onclick = toggleAuto;
+$('gear').onclick = openSettings;
+$('cancel').onclick = closeSettings;
+$('save').onclick = () => {
+  store.set('sl_key', $('key').value.trim());
+  store.set('sl_model', $('model').value.trim() || DEFAULT_MODEL);
+  store.set('sl_search', $('search').checked ? '1' : '0');
+  closeSettings();
+};
+document.addEventListener('visibilitychange', () => { if (document.hidden && autoTimer) toggleAuto(); });
+
+startCamera();
+if (!cfg().key) openSettings();
+</script>
+</body>
+</html>
