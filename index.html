@@ -21,7 +21,9 @@
   .row { display: flex; gap: 8px; margin-top: 10px; }
   button { flex: 1; padding: 13px 0; border: 0; border-radius: 10px; font-size: 15px;
     font-weight: 600; background: #2a2a2a; color: #fff; }
-  #describe { flex: 2; background: #1a73e8; }
+  #describe { flex: 1.6; background: #1a73e8; }
+  #mode.mcq { background: #b06000; }
+  button { font-size: 14px; }
   #auto.on { background: #188038; }
   button:disabled { opacity: .5; }
   #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none;
@@ -47,6 +49,7 @@
   <div id="result"></div>
   <div class="row">
     <button id="describe">Describe</button>
+    <button id="mode">Mode: Describe</button>
     <button id="auto">Auto: OFF</button>
     <button id="gear" aria-label="Settings">⚙</button>
   </div>
@@ -55,6 +58,10 @@
 <div id="settings">
   <div class="card">
     <h2>Settings</h2>
+    <label for="camera">Camera lens</label>
+    <select id="camera" style="width:100%;padding:11px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;font-size:15px"></select>
+    <div id="zoomWrap" style="display:none"><label for="zoom">Zoom <span id="zoomVal"></span></label>
+    <input id="zoom" type="range" style="width:100%"></div>
     <label for="provider">Provider</label>
     <select id="provider" style="width:100%;padding:11px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;font-size:15px">
       <option value="gemini">Google Gemini</option>
@@ -86,6 +93,14 @@ const PROMPT =
   'If it is an error or code, explain the cause and the fix. If it is a product, place or object, ' +
   'identify it. Plain text, no markdown.';
 
+const MCQ_PROMPT =
+  'This photo shows a screen with one or more multiple-choice questions. Ignore glare and the bezel. ' +
+  'For each question reply ONLY in this format, one per line:\n' +
+  'Q<number>: <letter>) <option text> — <reason in max 12 words>\n' +
+  'If more than one option is correct, list all letters. If there is no question, reply exactly: No question found. ' +
+  'No intro, no description of the image, no markdown.';
+const promptFor = mode => mode === 'mcq' ? MCQ_PROMPT : PROMPT;
+
 const $ = id => document.getElementById(id);
 const video = $('video'), statusEl = $('status'), resultEl = $('result');
 let busy = false, autoTimer = null, lastHash = null;
@@ -104,21 +119,67 @@ const cfg = () => ({
 });
 
 // ---------- camera ----------
+let stream = null;
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
     statusEl.textContent = 'Camera not available. Open this page over HTTPS in Chrome.';
     return;
   }
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-    });
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    const id = store.get('sl_cam', '');
+    const video_c = id
+      ? { deviceId: { exact: id }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } };
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: video_c });
+    } catch (e) {
+      if (!id) throw e;
+      store.set('sl_cam', '');           // saved lens gone: fall back to default back camera
+      return startCamera();
+    }
     video.srcObject = stream;
     await video.play();
+    applyZoom();
     statusEl.textContent = 'Point at a screen and tap Describe (or tap the picture)';
   } catch (e) {
     statusEl.textContent = 'Camera error: ' + e.message;
+  }
+}
+
+function applyZoom() {
+  const track = stream?.getVideoTracks()[0];
+  const caps = track?.getCapabilities?.() || {};
+  const z = parseFloat(store.get('sl_zoom', ''));
+  if (caps.zoom && !isNaN(z)) {
+    track.applyConstraints({ advanced: [{ zoom: Math.min(caps.zoom.max, Math.max(caps.zoom.min, z)) }] }).catch(() => {});
+  }
+}
+
+async function fillCameraSettings() {
+  const sel = $('camera');
+  sel.innerHTML = '';
+  try {
+    const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    const cur = stream?.getVideoTracks()[0]?.getSettings().deviceId || store.get('sl_cam', '');
+    cams.forEach((d, i) => {
+      const o = document.createElement('option');
+      o.value = d.deviceId;
+      o.textContent = d.label || `Camera ${i + 1}`;
+      if (d.deviceId === cur) o.selected = true;
+      sel.appendChild(o);
+    });
+  } catch {}
+  const track = stream?.getVideoTracks()[0];
+  const caps = track?.getCapabilities?.() || {};
+  if (caps.zoom) {
+    const z = $('zoom');
+    z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1;
+    z.value = track.getSettings().zoom ?? caps.zoom.min;
+    $('zoomVal').textContent = Number(z.value).toFixed(1) + 'x';
+    $('zoomWrap').style.display = 'block';
+  } else {
+    $('zoomWrap').style.display = 'none';
   }
 }
 
@@ -147,6 +208,7 @@ const hamming = (a, b) => a.reduce((n, v, i) => n + (v !== b[i]), 0);
 async function describe(auto) {
   if (busy) return;
   const c = cfg();
+  c.prompt = promptFor(store.get('sl_mode', 'describe'));
   const isClaude = c.provider === 'claude';
   if (isClaude ? !c.ckey : !c.key) { openSettings(); return; }
   const frame = grabFrame();
@@ -214,7 +276,7 @@ async function readSSE(res, onEvent) {
 
 async function streamGemini(c, b64, onText) {
   const body = { contents: [{ role: 'user', parts: [
-    { inline_data: { mime_type: 'image/jpeg', data: b64 } }, { text: PROMPT } ]}] };
+    { inline_data: { mime_type: 'image/jpeg', data: b64 } }, { text: c.prompt } ]}] };
   if (c.search) body.tools = [{ google_search: {} }];
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(c.model)}:streamGenerateContent?alt=sse`,
@@ -242,7 +304,7 @@ async function streamClaude(c, b64, onText) {
       model: c.cmodel, max_tokens: 400, stream: true,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
-        { type: 'text', text: PROMPT } ] }]
+        { type: 'text', text: c.prompt } ] }]
     })
   });
   await readSSE(res, j => {
@@ -264,7 +326,14 @@ function toggleAuto() {
   $('auto').classList.toggle('on', !!autoTimer);
 }
 
+function setModeLabel() {
+  const m = store.get('sl_mode', 'describe');
+  $('mode').textContent = m === 'mcq' ? 'Mode: MCQ' : 'Mode: Describe';
+  $('mode').classList.toggle('mcq', m === 'mcq');
+}
+
 function openSettings() {
+  fillCameraSettings();
   const c = cfg();
   $('key').value = c.key; $('model').value = c.model; $('search').checked = c.search;
   $('provider').value = c.provider; $('ckey').value = c.ckey; $('cmodel').value = c.cmodel;
@@ -275,6 +344,14 @@ function closeSettings() { $('settings').classList.remove('open'); }
 $('describe').onclick = () => describe(false);
 video.onclick = () => describe(false);
 $('auto').onclick = toggleAuto;
+$('mode').onclick = () => {
+  store.set('sl_mode', store.get('sl_mode', 'describe') === 'mcq' ? 'describe' : 'mcq');
+  setModeLabel();
+};
+$('zoom').oninput = () => {
+  $('zoomVal').textContent = Number($('zoom').value).toFixed(1) + 'x';
+  store.set('sl_zoom', $('zoom').value); applyZoom();
+};
 $('gear').onclick = openSettings;
 $('cancel').onclick = closeSettings;
 $('save').onclick = () => {
@@ -284,10 +361,15 @@ $('save').onclick = () => {
   store.set('sl_provider', $('provider').value);
   store.set('sl_ckey', $('ckey').value.trim());
   store.set('sl_cmodel', $('cmodel').value.trim() || DEFAULT_CLAUDE);
+  const cam = $('camera').value;
+  const camChanged = cam && cam !== store.get('sl_cam', '');
+  if (cam) store.set('sl_cam', cam);
   closeSettings();
+  if (camChanged) startCamera();
 };
 document.addEventListener('visibilitychange', () => { if (document.hidden && autoTimer) toggleAuto(); });
 
+setModeLabel();
 startCamera();
 { const c = cfg(); if (c.provider === 'claude' ? !c.ckey : !c.key) openSettings(); }
 </script>
