@@ -2,7 +2,7 @@
 
 Point your phone camera at any screen and get an instant AI explanation, shown as an overlay on the live camera view.
 
-**Live app:** https://mzainulabdeen.github.io/screenlens/
+**Live app:** https://zai-labs.github.io/screenlens/
 
 ## Features
 
