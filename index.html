@@ -11,8 +11,8 @@
   html, body { margin: 0; height: 100%; background: #000; color: #fff;
     font-family: system-ui, -apple-system, Roboto, sans-serif; overflow: hidden; }
   video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  #panel { position: fixed; left: 0; right: 0; bottom: 0;
-    padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+  #panel { position: fixed; left: 0; right: 0; top: 0;
+    padding: calc(12px + env(safe-area-inset-top)) 14px 12px;
     background: rgba(0,0,0,.78); backdrop-filter: blur(6px); }
   #status { font-size: 12px; color: #aaa; min-height: 16px; }
   #result { margin-top: 6px; font-size: 16px; line-height: 1.4; max-height: 38vh;
@@ -21,9 +21,14 @@
   .row { display: flex; gap: 8px; margin-top: 10px; }
   button { flex: 1; padding: 13px 0; border: 0; border-radius: 10px; font-size: 15px;
     font-weight: 600; background: #2a2a2a; color: #fff; }
-  #describe { flex: 1.6; background: #1a73e8; }
-  #mode.mcq { background: #b06000; }
-  button { font-size: 14px; }
+  #side { position: fixed; right: 14px; top: 50%; transform: translateY(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 14px; z-index: 5; }
+  #describe { flex: none; width: 78px; height: 78px; border-radius: 50%; background: #1a73e8;
+    font-size: 13px; box-shadow: 0 4px 14px rgba(0,0,0,.5); border: 3px solid rgba(255,255,255,.85); }
+  #describe.mcq { background: #b06000; }
+  #describe.auto { border-color: #34a853; }
+  #gear { flex: none; width: 46px; height: 46px; border-radius: 50%; padding: 0;
+    background: rgba(0,0,0,.6); font-size: 20px; }
   #auto.on { background: #188038; }
   button:disabled { opacity: .5; }
   #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none;
@@ -31,7 +36,8 @@
   #settings { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none;
     align-items: center; justify-content: center; padding: 20px; z-index: 10; }
   #settings.open { display: flex; }
-  .card { background: #1e1e1e; border-radius: 14px; padding: 18px; width: 100%; max-width: 420px; }
+  .card { background: #1e1e1e; border-radius: 14px; padding: 18px; width: 100%; max-width: 420px;
+    max-height: 92vh; overflow-y: auto; }
   .card h2 { margin: 0 0 12px; font-size: 18px; }
   .card label { display: block; font-size: 13px; color: #bbb; margin: 10px 0 4px; }
   .card input[type=text], .card input[type=password] { width: 100%; padding: 11px;
@@ -47,17 +53,22 @@
 <div id="panel">
   <div id="status">Starting camera…</div>
   <div id="result"></div>
-  <div class="row">
-    <button id="describe">Describe</button>
-    <button id="mode">Mode: Describe</button>
-    <button id="auto">Auto: OFF</button>
-    <button id="gear" aria-label="Settings">⚙</button>
-  </div>
+</div>
+
+<div id="side">
+  <button id="describe">Describe</button>
+  <button id="gear" aria-label="Settings">⚙</button>
 </div>
 
 <div id="settings">
   <div class="card">
     <h2>Settings</h2>
+    <label for="modeSel">Mode</label>
+    <select id="modeSel" style="width:100%;padding:11px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;font-size:15px">
+      <option value="describe">Describe the screen</option>
+      <option value="mcq">MCQ — answer only</option>
+    </select>
+    <div class="chk"><input id="autoChk" type="checkbox"><label for="autoChk" style="margin:0;color:#ddd">Auto — re-check every 3 s</label></div>
     <label for="camera">Camera lens</label>
     <select id="camera" style="width:100%;padding:11px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;font-size:15px"></select>
     <div id="zoomWrap" style="display:none"><label for="zoom">Zoom <span id="zoomVal"></span></label>
@@ -141,7 +152,7 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     applyZoom();
-    statusEl.textContent = 'Point at a screen and tap Describe (or tap the picture)';
+    statusEl.textContent = 'Point at a screen and tap the blue button (or the picture)';
   } catch (e) {
     statusEl.textContent = 'Camera error: ' + e.message;
   }
@@ -315,27 +326,28 @@ async function streamClaude(c, b64, onText) {
 }
 
 // ---------- UI ----------
-function toggleAuto() {
-  if (autoTimer) {
-    clearInterval(autoTimer); autoTimer = null;
-  } else {
+function setAuto(on) {
+  if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  if (on) {
     lastHash = null; describe(true);
     autoTimer = setInterval(() => describe(true), AUTO_MS);
   }
-  $('auto').textContent = autoTimer ? 'Auto: ON' : 'Auto: OFF';
-  $('auto').classList.toggle('on', !!autoTimer);
+  setModeLabel();
 }
 
 function setModeLabel() {
   const m = store.get('sl_mode', 'describe');
-  $('mode').textContent = m === 'mcq' ? 'Mode: MCQ' : 'Mode: Describe';
-  $('mode').classList.toggle('mcq', m === 'mcq');
+  $('describe').textContent = m === 'mcq' ? 'Answer' : 'Describe';
+  $('describe').classList.toggle('mcq', m === 'mcq');
+  $('describe').classList.toggle('auto', !!autoTimer);
 }
 
 function openSettings() {
   fillCameraSettings();
   const c = cfg();
   $('key').value = c.key; $('model').value = c.model; $('search').checked = c.search;
+  $('modeSel').value = store.get('sl_mode', 'describe');
+  $('autoChk').checked = !!autoTimer;
   $('provider').value = c.provider; $('ckey').value = c.ckey; $('cmodel').value = c.cmodel;
   $('settings').classList.add('open');
 }
@@ -343,11 +355,7 @@ function closeSettings() { $('settings').classList.remove('open'); }
 
 $('describe').onclick = () => describe(false);
 video.onclick = () => describe(false);
-$('auto').onclick = toggleAuto;
-$('mode').onclick = () => {
-  store.set('sl_mode', store.get('sl_mode', 'describe') === 'mcq' ? 'describe' : 'mcq');
-  setModeLabel();
-};
+
 $('zoom').oninput = () => {
   $('zoomVal').textContent = Number($('zoom').value).toFixed(1) + 'x';
   store.set('sl_zoom', $('zoom').value); applyZoom();
@@ -361,13 +369,15 @@ $('save').onclick = () => {
   store.set('sl_provider', $('provider').value);
   store.set('sl_ckey', $('ckey').value.trim());
   store.set('sl_cmodel', $('cmodel').value.trim() || DEFAULT_CLAUDE);
+  store.set('sl_mode', $('modeSel').value);
+  setAuto($('autoChk').checked);
   const cam = $('camera').value;
   const camChanged = cam && cam !== store.get('sl_cam', '');
   if (cam) store.set('sl_cam', cam);
   closeSettings();
   if (camChanged) startCamera();
 };
-document.addEventListener('visibilitychange', () => { if (document.hidden && autoTimer) toggleAuto(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && autoTimer) setAuto(false); });
 
 setModeLabel();
 startCamera();
