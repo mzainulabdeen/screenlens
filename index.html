@@ -55,11 +55,20 @@
 <div id="settings">
   <div class="card">
     <h2>Settings</h2>
+    <label for="provider">Provider</label>
+    <select id="provider" style="width:100%;padding:11px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;font-size:15px">
+      <option value="gemini">Google Gemini</option>
+      <option value="claude">Anthropic Claude</option>
+    </select>
+    <label for="ckey">Claude API key — from <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a></label>
+    <input id="ckey" type="password" autocomplete="off" placeholder="sk-ant-…">
+    <label for="cmodel">Claude model</label>
+    <input id="cmodel" type="text" placeholder="claude-haiku-5-5">
     <label for="key">Gemini API key — free at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a></label>
     <input id="key" type="password" autocomplete="off" placeholder="AIza…">
-    <label for="model">Model</label>
+    <label for="model">Gemini model</label>
     <input id="model" type="text" placeholder="gemini-flash-latest">
-    <div class="chk"><input id="search" type="checkbox" checked><label for="search" style="margin:0;color:#ddd">Use Google Search grounding</label></div>
+    <div class="chk"><input id="search" type="checkbox" checked><label for="search" style="margin:0;color:#ddd">Use Google Search grounding (Gemini only)</label></div>
     <div class="row">
       <button id="cancel">Cancel</button>
       <button id="save" style="background:#1a73e8">Save</button>
@@ -69,6 +78,7 @@
 
 <script>
 const DEFAULT_MODEL = 'gemini-flash-latest';
+const DEFAULT_CLAUDE = 'claude-haiku-5-5';
 const AUTO_MS = 3000;
 const PROMPT =
   'This is a phone-camera photo of a screen (monitor, laptop, TV or phone). ' +
@@ -87,7 +97,10 @@ const store = {
 const cfg = () => ({
   key: store.get('sl_key', '').trim(),
   model: store.get('sl_model', DEFAULT_MODEL).trim() || DEFAULT_MODEL,
-  search: store.get('sl_search', '1') === '1'
+  search: store.get('sl_search', '1') === '1',
+  provider: store.get('sl_provider', 'gemini'),
+  ckey: store.get('sl_ckey', '').trim(),
+  cmodel: store.get('sl_cmodel', DEFAULT_CLAUDE).trim() || DEFAULT_CLAUDE
 });
 
 // ---------- camera ----------
@@ -133,8 +146,9 @@ const hamming = (a, b) => a.reduce((n, v, i) => n + (v !== b[i]), 0);
 // ---------- Gemini ----------
 async function describe(auto) {
   if (busy) return;
-  const { key, model, search } = cfg();
-  if (!key) { openSettings(); return; }
+  const c = cfg();
+  const isClaude = c.provider === 'claude';
+  if (isClaude ? !c.ckey : !c.key) { openSettings(); return; }
   const frame = grabFrame();
   if (!frame) return;
 
@@ -145,53 +159,15 @@ async function describe(auto) {
   busy = true;
   $('describe').disabled = true;
   if (!auto) { $('flash').style.opacity = .5; setTimeout(() => $('flash').style.opacity = 0, 120); }
-  statusEl.textContent = `Thinking… (${model}${search ? ' + Google Search' : ''})`;
+  statusEl.textContent = isClaude ? `Thinking… (${c.cmodel})` : `Thinking… (${c.model}${c.search ? ' + Google Search' : ''})`;
   resultEl.textContent = '';
   const t0 = performance.now();
 
   const b64 = frame.toDataURL('image/jpeg', 0.8).split(',')[1];
-  const body = {
-    contents: [{ role: 'user', parts: [
-      { inline_data: { mime_type: 'image/jpeg', data: b64 } },
-      { text: PROMPT }
-    ]}]
-  };
-  if (search) body.tools = [{ google_search: {} }];
-
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify(body) });
-
-    if (!res.ok) {
-      const t = await res.text();
-      let msg = t; try { msg = JSON.parse(t).error.message; } catch {}
-      throw new Error(`HTTP ${res.status}: ${msg}`);
-    }
-
-    const sources = new Set();
-    const reader = res.body.getReader(), dec = new TextDecoder();
-    let buf = '';
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
-        if (!line.startsWith('data:')) continue;
-        let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
-        const cand = j.candidates?.[0];
-        for (const p of cand?.content?.parts ?? []) {
-          if (p.text && !p.thought) resultEl.textContent += p.text;
-        }
-        for (const ch of cand?.groundingMetadata?.groundingChunks ?? []) {
-          if (ch.web?.title) sources.add(ch.web.title);
-        }
-        resultEl.scrollTop = resultEl.scrollHeight;
-      }
-    }
+    const sources = isClaude
+      ? await streamClaude(c, b64, t => { resultEl.textContent += t; resultEl.scrollTop = resultEl.scrollHeight; })
+      : await streamGemini(c, b64, t => { resultEl.textContent += t; resultEl.scrollTop = resultEl.scrollHeight; });
     if (sources.size) resultEl.textContent += '\n\nSources: ' + [...sources].slice(0, 3).join(' · ');
     statusEl.textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(1)}s — tap to describe again`;
   } catch (e) {
@@ -201,6 +177,68 @@ async function describe(auto) {
     busy = false;
     $('describe').disabled = false;
   }
+}
+
+async function readSSE(res, onEvent) {
+  if (!res.ok) {
+    const t = await res.text();
+    let msg = t; try { msg = JSON.parse(t).error.message; } catch {}
+    throw new Error(`HTTP ${res.status}: ${msg}`);
+  }
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;
+      let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
+      onEvent(j);
+    }
+  }
+}
+
+async function streamGemini(c, b64, onText) {
+  const body = { contents: [{ role: 'user', parts: [
+    { inline_data: { mime_type: 'image/jpeg', data: b64 } }, { text: PROMPT } ]}] };
+  if (c.search) body.tools = [{ google_search: {} }];
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(c.model)}:streamGenerateContent?alt=sse`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': c.key },
+      body: JSON.stringify(body) });
+  const sources = new Set();
+  await readSSE(res, j => {
+    const cand = j.candidates?.[0];
+    for (const p of cand?.content?.parts ?? []) if (p.text && !p.thought) onText(p.text);
+    for (const ch of cand?.groundingMetadata?.groundingChunks ?? []) if (ch.web?.title) sources.add(ch.web.title);
+  });
+  return sources;
+}
+
+async function streamClaude(c, b64, onText) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': c.ckey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: c.cmodel, max_tokens: 400, stream: true,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } },
+        { type: 'text', text: PROMPT } ] }]
+    })
+  });
+  await readSSE(res, j => {
+    if (j.type === 'content_block_delta' && j.delta?.type === 'text_delta') onText(j.delta.text);
+    if (j.type === 'error') throw new Error(j.error?.message || 'Claude error');
+  });
+  return new Set();
 }
 
 // ---------- UI ----------
@@ -218,6 +256,7 @@ function toggleAuto() {
 function openSettings() {
   const c = cfg();
   $('key').value = c.key; $('model').value = c.model; $('search').checked = c.search;
+  $('provider').value = c.provider; $('ckey').value = c.ckey; $('cmodel').value = c.cmodel;
   $('settings').classList.add('open');
 }
 function closeSettings() { $('settings').classList.remove('open'); }
@@ -231,12 +270,15 @@ $('save').onclick = () => {
   store.set('sl_key', $('key').value.trim());
   store.set('sl_model', $('model').value.trim() || DEFAULT_MODEL);
   store.set('sl_search', $('search').checked ? '1' : '0');
+  store.set('sl_provider', $('provider').value);
+  store.set('sl_ckey', $('ckey').value.trim());
+  store.set('sl_cmodel', $('cmodel').value.trim() || DEFAULT_CLAUDE);
   closeSettings();
 };
 document.addEventListener('visibilitychange', () => { if (document.hidden && autoTimer) toggleAuto(); });
 
 startCamera();
-if (!cfg().key) openSettings();
+{ const c = cfg(); if (c.provider === 'claude' ? !c.ckey : !c.key) openSettings(); }
 </script>
 </body>
 </html>
