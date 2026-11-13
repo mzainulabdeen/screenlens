@@ -6,6 +6,9 @@
 <meta name="theme-color" content="#000000">
 <meta name="mobile-web-app-capable" content="yes">
 <title>ScreenLens</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: #000; color: #fff;
@@ -27,7 +30,7 @@
     font-size: 13px; box-shadow: 0 4px 14px rgba(0,0,0,.5); border: 3px solid rgba(255,255,255,.85); }
   #describe.mcq { background: #b06000; }
   #describe.auto { border-color: #34a853; }
-  #gear { flex: none; width: 46px; height: 46px; border-radius: 50%; padding: 0;
+  #gear, #fs { flex: none; width: 46px; height: 46px; border-radius: 50%; padding: 0;
     background: rgba(0,0,0,.6); font-size: 20px; }
   #auto.on { background: #188038; }
   button:disabled { opacity: .5; }
@@ -58,6 +61,7 @@
 <div id="side">
   <button id="describe">Describe</button>
   <button id="gear" aria-label="Settings">⚙</button>
+  <button id="fs" aria-label="Full screen">⛶</button>
 </div>
 
 <div id="settings">
@@ -378,6 +382,23 @@ $('save').onclick = () => {
   if (camChanged) startCamera();
 };
 document.addEventListener('visibilitychange', () => { if (document.hidden && autoTimer) setAuto(false); });
+
+// ---------- full screen ----------
+const standalone = matchMedia('(display-mode: fullscreen), (display-mode: standalone)').matches;
+function goFullscreen() {
+  const el = document.documentElement;
+  if (!document.fullscreenElement && el.requestFullscreen) {
+    el.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+  }
+}
+if (standalone) $('fs').style.display = 'none';
+$('fs').onclick = () => document.fullscreenElement ? document.exitFullscreen() : goFullscreen();
+// first tap anywhere in a normal Chrome tab -> go full screen
+document.addEventListener('click', function once(e) {
+  if (!standalone && !e.target.closest('#settings, #fs')) goFullscreen();
+  document.removeEventListener('click', once, true);
+}, true);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 
 setModeLabel();
 startCamera();
